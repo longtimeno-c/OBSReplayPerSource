@@ -51,6 +51,8 @@ std::string output_directory;
 std::string replay_scene_name = "Replay Scene";
 std::string replay_source_name = "ReplaySource";
 std::string previous_scene_name;
+std::string current_group;
+std::map<std::string, std::vector<std::string>> scene_groups; // Group to scene mapping
 
 std::deque<std::string> error_log;
 const size_t max_errors = 10;
@@ -73,6 +75,52 @@ std::string get_error_log_text() {
         error_text += "[ERROR] " + error + "\n";
     }
     return error_text;
+}
+
+// Update scene buffers based on the active group
+void update_scene_buffers() {
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+
+    // Clear all scene buffers
+    scene_buffers.clear();
+
+    if (current_group.empty() || scene_groups.find(current_group) == scene_groups.end()) {
+        log_error("No active group or group not found. Monitoring all scenes.");
+
+        // Fallback: Monitor all scenes
+        obs_source_list_t *sources = obs_enum_sources();
+        if (sources) {
+            for (size_t i = 0; i < sources->num; ++i) {
+                obs_source_t *source = sources->sources[i];
+                if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE) {
+                    const char *scene_name = obs_source_get_name(source);
+                    if (scene_name) {
+                        scene_buffers[scene_name] = FrameBuffer(30, 30); // 30 seconds buffer
+                    }
+                }
+            }
+            obs_source_list_release(sources);
+        }
+        return;
+    }
+
+    // Populate buffers for scenes in the active group
+    for (const auto &scene_name : scene_groups[current_group]) {
+        scene_buffers[scene_name] = FrameBuffer(30, 30); // Assume 30 FPS and 30 seconds buffer
+    }
+
+    blog(LOG_INFO, "Scene buffers updated for group: %s", current_group.c_str());
+}
+
+
+// Set active group and update buffers
+void set_active_group(const std::string &group_name) {
+    if (scene_groups.find(group_name) != scene_groups.end()) {
+        current_group = group_name;
+        update_scene_buffers();
+    } else {
+        log_error("Group not found: " + group_name);
+    }
 }
 
 // Create Replay Scene and Source
