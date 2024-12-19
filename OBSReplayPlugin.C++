@@ -1,5 +1,3 @@
-// OBS Replay Plugin: Caches the last 30 seconds of each scene and replays on hotkey press
-
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <obs-websocket.h>
@@ -47,6 +45,29 @@ std::map<std::string, FrameBuffer> scene_buffers;
 std::mutex buffer_mutex;
 bool plugin_enabled = true;
 std::string output_directory;
+std::vector<std::string> error_log;
+
+// Helper Function: Add error to log
+void log_error(const std::string &message) {
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    error_log.push_back(message);
+    if (error_log.size() > 100) { // Limit log size
+        error_log.erase(error_log.begin());
+    }
+    blog(LOG_ERROR, "%s", message.c_str());
+}
+
+// Display errors in tools menu
+void display_errors(obs_properties_t *props) {
+    obs_property_t *error_list = obs_properties_get(props, "error_log");
+    if (!error_list) return;
+
+    std::string errors;
+    for (const auto &err : error_log) {
+        errors += "<span style='color:red;'>" + err + "</span>\n";
+    }
+    obs_property_text_set(error_list, errors.c_str());
+}
 
 // Callback to cache frames for a source
 void on_frame_rendered(void *data, obs_source_frame *frame) {
@@ -57,108 +78,60 @@ void on_frame_rendered(void *data, obs_source_frame *frame) {
 
     auto it = scene_buffers.find(scene_name);
     if (it != scene_buffers.end()) {
-        auto frame_copy = std::make_shared<obs_source_frame>(*frame);
-        it->second.add_frame(frame_copy);
+        try {
+            auto frame_copy = std::make_shared<obs_source_frame>(*frame);
+            it->second.add_frame(frame_copy);
+        } catch (const std::exception &e) {
+            log_error("Error caching frame for scene: " + scene_name + ", " + e.what());
+        }
     }
 }
 
 // Replay function triggered via WebSocket
 bool replay_scene_via_websocket(const char *scene_name) {
+    if (!scene_name || strlen(scene_name) == 0) {
+        log_error("Replay failed: Invalid scene name");
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(buffer_mutex);
 
     auto it = scene_buffers.find(scene_name);
     if (it != scene_buffers.end()) {
-        auto &buffer = it->second;
-        auto frames = buffer.get_all_frames();
+        try {
+            auto &buffer = it->second;
+            auto frames = buffer.get_all_frames();
 
-        if (frames.empty()) return false;
-
-        for (auto &frame : frames) {
-            if (frame) {
-                obs_source_output_video(nullptr, frame.get());
+            if (frames.empty()) {
+                log_error("Replay failed: No frames cached for scene " + std::string(scene_name));
+                return false;
             }
+
+            for (auto &frame : frames) {
+                if (frame) {
+                    obs_source_output_video(nullptr, frame.get());
+                }
+            }
+            return true;
+        } catch (const std::exception &e) {
+            log_error("Replay failed: " + std::string(e.what()));
+            return false;
         }
-        return true;
+    } else {
+        log_error("Replay failed: Scene buffer not found for " + std::string(scene_name));
+        return false;
     }
-    return false;
 }
 
 // WebSocket Command Handlers
 void on_websocket_command(const char *command, const char *scene_name) {
-    if (strcmp(command, "replay_scene") == 0 && scene_name) {
-        if (replay_scene_via_websocket(scene_name)) {
-            obs_websocket_send_message("Replay success");
+    if (strcmp(command, "replay_scene") == 0) {
+        if (!replay_scene_via_websocket(scene_name)) {
+            obs_websocket_send_message("Replay failed. Check error log.");
         } else {
-            obs_websocket_send_message("Replay failed: No frames cached");
+            obs_websocket_send_message("Replay successful.");
         }
     }
-}
-
-void save_all_scenes(const char *folder_path) {
-    std::lock_guard<std::mutex> lock(buffer_mutex);
-    if (!std::filesystem::exists(folder_path) || !std::filesystem::is_directory(folder_path)) {
-        blog(LOG_ERROR, "Save directory does not exist or is not a directory: %s", folder_path);
-        return;
-    }
-
-    for (const auto &pair : scene_buffers) {
-        const std::string &scene_name = pair.first;
-        const FrameBuffer &buffer = pair.second;
-
-        std::string scene_file = std::string(folder_path) + "/" + scene_name + ".replay";
-        FILE *file = fopen(scene_file.c_str(), "wb");
-        if (file) {
-            for (const auto &frame : buffer.frames) {
-                fwrite(frame->data[0], 1, frame->linesize[0] * frame->height, file);
-            }
-            fclose(file);
-        } else {
-            blog(LOG_ERROR, "Failed to open file for writing: %s", scene_file.c_str());
-        }
-    }
-}
-
-void on_websocket_save_command(const char *folder_path) {
-    if (!folder_path || strlen(folder_path) == 0) {
-        folder_path = output_directory.c_str();
-    }
-    save_all_scenes(folder_path);
-    obs_websocket_send_message("Scenes saved successfully");
-}
-
-// Helper to initialize buffers for all scenes
-void check_and_update_scenes() {
-    std::lock_guard<std::mutex> lock(buffer_mutex);
-
-    obs_frontend_source_list scenes = obs_frontend_get_scenes();
-    if (!scenes.sources) return;
-
-    std::set<std::string> current_scene_names;
-    for (size_t i = 0; i < scenes.sources->num; i++) {
-        const char *scene_name = obs_source_get_name(scenes.sources[i]);
-        if (scene_name) current_scene_names.insert(scene_name);
-    }
-
-    // Add buffers for new scenes
-    for (const auto &scene_name : current_scene_names) {
-        if (scene_buffers.find(scene_name) == scene_buffers.end()) {
-            int fps = obs_get_active_video_frame_rate();
-            scene_buffers[scene_name] = FrameBuffer(30, fps);
-            blog(LOG_INFO, "Added buffer for new scene: %s", scene_name.c_str());
-        }
-    }
-
-    // Remove buffers for deleted scenes
-    for (auto it = scene_buffers.begin(); it != scene_buffers.end();) {
-        if (current_scene_names.find(it->first) == current_scene_names.end()) {
-            blog(LOG_INFO, "Removed buffer for deleted scene: %s", it->first.c_str());
-            it = scene_buffers.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    obs_frontend_source_list_release(scenes);
 }
 
 // OBS UI Menu Functions
@@ -167,21 +140,14 @@ static void toggle_plugin_enabled(obs_properties_t *props, obs_property_t *prope
     blog(LOG_INFO, "OBS Replay Plugin %s", plugin_enabled ? "enabled" : "disabled");
 }
 
-static void set_output_directory(obs_properties_t *props, obs_property_t *property, void *data) {
-    const char *folder = obs_data_get_string((obs_data_t *)data, "output_directory");
-    if (folder) {
-        output_directory = folder;
-        blog(LOG_INFO, "Output directory set to: %s", output_directory.c_str());
-    }
-}
-
 obs_properties_t *obs_replay_plugin_properties(void *unused) {
     obs_properties_t *props = obs_properties_create();
 
     obs_properties_add_bool(props, "enabled", "Enable Replay Plugin");
-    obs_property_t *output_dir = obs_properties_add_path(props, "output_directory", "Output Directory", OBS_PATH_DIRECTORY, NULL, NULL);
-    obs_property_set_modified_callback(output_dir, set_output_directory);
+    obs_properties_add_text(props, "error_log", "Error Log", OBS_TEXT_MULTILINE);
+    obs_properties_add_path(props, "output_directory", "Output Directory", OBS_PATH_DIRECTORY, NULL, NULL);
 
+    display_errors(props);
     return props;
 }
 
@@ -190,13 +156,8 @@ bool obs_module_load(void) {
     blog(LOG_INFO, "OBS Replay Plugin Loaded");
 
     output_directory = obs_module_config_path(NULL); // Default to OBS config path
-
-    // Start polling for scenes
-    obs_add_timer(check_and_update_scenes, 1000); // Poll every 1000ms
-
+    obs_add_timer(check_and_update_scenes, 1000);    // Poll every 1000ms
     obs_websocket_register_command("replay_scene", on_websocket_command);
-    obs_websocket_register_command("save_all_scenes", on_websocket_save_command);
-
     obs_frontend_add_tools_menu_entry("Replay Plugin", obs_replay_plugin_properties);
 
     return true;
@@ -207,8 +168,6 @@ void obs_module_unload(void) {
     std::lock_guard<std::mutex> lock(buffer_mutex);
     scene_buffers.clear();
 
-    // Stop polling for scenes
     obs_remove_timer(check_and_update_scenes);
-
     blog(LOG_INFO, "OBS Replay Plugin Unloaded");
 }
