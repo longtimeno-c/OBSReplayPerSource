@@ -190,32 +190,6 @@ void play_cached_frames(const std::string &scene_name) {
     obs_source_release(replay_source);
 }
 
-// Play Replay and Return to Previous Scene
-void play_replay_and_return(const std::string &scene_name) {
-    // Save current scene
-    obs_source_t *current_scene = obs_frontend_get_current_scene();
-    if (current_scene) {
-        previous_scene_name = obs_source_get_name(current_scene);
-        obs_source_release(current_scene);
-    }
-
-    // Switch to replay scene
-    switch_to_scene(replay_scene_name);
-
-    // Play cached frames for the given scene
-    play_cached_frames(scene_name);
-
-    // Switch back to previous scene
-    switch_to_scene(previous_scene_name);
-}
-
-// WebSocket Command Handler
-void on_websocket_command(const char *command, const char *scene_name) {
-    if (strcmp(command, "replay_scene") == 0) {
-        std::thread(play_replay_and_return, scene_name).detach(); // Run replay in a separate thread
-    }
-}
-
 // Helper Function: Save frames to a video file
 void save_frames_to_file(const std::string &scene_name, const std::vector<std::shared_ptr<obs_source_frame>> &frames) {
     // Determine file path
@@ -249,6 +223,37 @@ void save_frames_to_file(const std::string &scene_name, const std::vector<std::s
     obs_output_stop(output);
     obs_output_release(output);
     blog(LOG_INFO, "Saved replay for scene: %s to file: %s", scene_name.c_str(), file_path.c_str());
+}
+
+// Play Replay and Return to Previous Scene
+void play_replay_and_return(const std::string &scene_name) {
+    // Save current scene
+    obs_source_t *current_scene = obs_frontend_get_current_scene();
+    if (current_scene) {
+        previous_scene_name = obs_source_get_name(current_scene);
+        obs_source_release(current_scene);
+    }
+
+    // Switch to replay scene
+    switch_to_scene(replay_scene_name);
+
+    // Play cached frames for the given scene
+    auto it = scene_buffers.find(scene_name);
+    if (it != scene_buffers.end()) {
+        save_frames_to_file(scene_name, it->second.get_all_frames()); // Save replay to file
+    }
+
+    play_cached_frames(scene_name);
+
+    // Switch back to previous scene
+    switch_to_scene(previous_scene_name);
+}
+
+// WebSocket Command Handler
+void on_websocket_command(const char *command, const char *scene_name) {
+    if (strcmp(command, "replay_scene") == 0) {
+        std::thread(play_replay_and_return, scene_name).detach(); // Run replay in a separate thread
+    }
 }
 
 // WebSocket Command: Save all replays
