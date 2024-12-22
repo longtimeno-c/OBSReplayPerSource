@@ -95,7 +95,7 @@ void update_scene_buffers() {
                 if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE) {
                     const char *scene_name = obs_source_get_name(source);
                     if (scene_name) {
-                        scene_buffers[scene_name] = FrameBuffer(30, 30); // 30 seconds buffer
+                        scene_buffers[scene_name] = FrameBuffer(30, 60); // 30 seconds buffer
                     }
                 }
             }
@@ -106,7 +106,7 @@ void update_scene_buffers() {
 
     // Populate buffers for scenes in the active group
     for (const auto &scene_name : scene_groups[current_group]) {
-        scene_buffers[scene_name] = FrameBuffer(30, 30); // Assume 30 FPS and 30 seconds buffer
+        scene_buffers[scene_name] = FrameBuffer(30, 60); // Assume 60 FPS and 30 seconds buffer
     }
 
     blog(LOG_INFO, "Scene buffers updated for group: %s", current_group.c_str());
