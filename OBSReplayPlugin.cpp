@@ -24,22 +24,34 @@ MODULE_EXPORT const char *obs_module_description(void) {
 
 // Circular buffer for caching frames
 struct FrameBuffer {
-    std::deque<std::shared_ptr<obs_source_frame>> frames;
+    std::deque<std::shared_ptr<obs_source_frame>> video_frames;
+    std::deque<std::shared_ptr<obs_source_audio>> audio_frames;
     size_t max_frames;
 
     FrameBuffer(size_t max_seconds, int fps) {
         max_frames = max_seconds * fps;
     }
 
-    void add_frame(std::shared_ptr<obs_source_frame> frame) {
-        if (frames.size() >= max_frames) {
-            frames.pop_front();
+    void add_video_frame(std::shared_ptr<obs_source_frame> frame) {
+        if (video_frames.size() >= max_frames) {
+            video_frames.pop_front();
         }
-        frames.push_back(frame);
+        video_frames.push_back(frame);
     }
 
-    std::vector<std::shared_ptr<obs_source_frame>> get_all_frames() {
-        return std::vector<std::shared_ptr<obs_source_frame>>(frames.begin(), frames.end());
+    void add_audio_frame(std::shared_ptr<obs_source_audio> frame) {
+        if (audio_frames.size() >= max_frames) {
+            audio_frames.pop_front();
+        }
+        audio_frames.push_back(frame);
+    }
+
+    std::vector<std::shared_ptr<obs_source_frame>> get_video_frames() {
+        return std::vector<std::shared_ptr<obs_source_frame>>(video_frames.begin(), video_frames.end());
+    }
+
+    std::vector<std::shared_ptr<obs_source_audio>> get_audio_frames() {
+        return std::vector<std::shared_ptr<obs_source_audio>>(audio_frames.begin(), audio_frames.end());
     }
 };
 
@@ -112,7 +124,6 @@ void update_scene_buffers() {
     blog(LOG_INFO, "Scene buffers updated for group: %s", current_group.c_str());
 }
 
-
 // Set active group and update buffers
 void set_active_group(const std::string &group_name) {
     if (scene_groups.find(group_name) != scene_groups.end()) {
@@ -120,6 +131,31 @@ void set_active_group(const std::string &group_name) {
         update_scene_buffers();
     } else {
         log_error("Group not found: " + group_name);
+    }
+}
+
+// Capture audio frames
+void capture_audio_frames(obs_source_t *source, obs_source_audio *audio) {
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+
+    const char *source_name = obs_source_get_name(source);
+    auto it = scene_buffers.find(source_name);
+    if (it != scene_buffers.end()) {
+        it->second.add_audio_frame(std::make_shared<obs_source_audio>(*audio));
+    }
+}
+
+// Start capturing audio
+void start_audio_capture() {
+    obs_source_list_t *sources = obs_enum_sources();
+    if (sources) {
+        for (size_t i = 0; i < sources->num; ++i) {
+            obs_source_t *source = sources->sources[i];
+            if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
+                obs_source_add_audio_capture_callback(source, capture_audio_frames, nullptr);
+            }
+        }
+        obs_source_list_release(sources);
     }
 }
 
@@ -168,8 +204,10 @@ void play_cached_frames(const std::string &scene_name) {
         return;
     }
 
-    auto frames = it->second.get_all_frames();
-    if (frames.empty()) {
+    auto video_frames = it->second.get_video_frames();
+    auto audio_frames = it->second.get_audio_frames();
+
+    if (video_frames.empty() || audio_frames.empty()) {
         log_error("Cached frames are empty for scene: " + scene_name);
         return;
     }
@@ -180,18 +218,23 @@ void play_cached_frames(const std::string &scene_name) {
         return;
     }
 
-    for (auto &frame : frames) {
-        if (frame) {
-            obs_source_output_video(replay_source, frame.get());
-            std::this_thread::sleep_for(std::chrono::milliseconds(33)); // Simulate 30fps playback
+    for (size_t i = 0; i < video_frames.size(); ++i) {
+        if (i < audio_frames.size() && audio_frames[i]) {
+            obs_source_output_audio(replay_source, audio_frames[i].get());
         }
+        if (video_frames[i]) {
+            obs_source_output_video(replay_source, video_frames[i].get());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(33)); // Simulate 30fps playback
     }
 
     obs_source_release(replay_source);
 }
 
-// Helper Function: Save frames to a video file
-void save_frames_to_file(const std::string &scene_name, const std::vector<std::shared_ptr<obs_source_frame>> &frames) {
+// Save frames to file
+void save_frames_to_file(const std::string &scene_name, 
+                         const std::vector<std::shared_ptr<obs_source_frame>> &video_frames, 
+                         const std::vector<std::shared_ptr<obs_source_audio>> &audio_frames) {
     // Determine file path
     std::string file_path = output_directory + "/" + scene_name + "_replay.mp4";
 
@@ -213,10 +256,13 @@ void save_frames_to_file(const std::string &scene_name, const std::vector<std::s
         return;
     }
 
-    // Write frames
-    for (auto &frame : frames) {
-        if (frame) {
-            obs_output_video(output, frame.get());
+    // Write video and audio frames
+    for (size_t i = 0; i < video_frames.size(); ++i) {
+        if (i < audio_frames.size() && audio_frames[i]) {
+            obs_output_audio(output, audio_frames[i].get());
+        }
+        if (video_frames[i]) {
+            obs_output_video(output, video_frames[i].get());
         }
     }
 
@@ -240,7 +286,7 @@ void play_replay_and_return(const std::string &scene_name) {
     // Play cached frames for the given scene
     auto it = scene_buffers.find(scene_name);
     if (it != scene_buffers.end()) {
-        save_frames_to_file(scene_name, it->second.get_all_frames()); // Save replay to file
+        save_frames_to_file(scene_name, it->second.get_video_frames(), it->second.get_audio_frames());
     }
 
     play_cached_frames(scene_name);
@@ -262,12 +308,13 @@ void on_save_all_replays_command(const char *command, const char *args) {
 
     for (auto &buffer_pair : scene_buffers) {
         const std::string &scene_name = buffer_pair.first;
-        const auto &frames = buffer_pair.second.get_all_frames();
-        if (frames.empty()) {
+        const auto &video_frames = buffer_pair.second.get_video_frames();
+        const auto &audio_frames = buffer_pair.second.get_audio_frames();
+        if (video_frames.empty() || audio_frames.empty()) {
             log_error("No cached frames for scene: " + scene_name);
             continue;
         }
-        save_frames_to_file(scene_name, frames);
+        save_frames_to_file(scene_name, video_frames, audio_frames);
     }
 
     blog(LOG_INFO, "Saved replays for all scenes.");
@@ -309,6 +356,9 @@ bool obs_module_load(void) {
 
     // Create Replay Scene
     create_replay_scene_and_source();
+
+    // Start Audio Capture
+    start_audio_capture();
 
     // Register WebSocket Commands
     obs_websocket_register_command("replay_scene", on_websocket_command);
