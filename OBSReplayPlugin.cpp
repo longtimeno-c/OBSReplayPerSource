@@ -12,13 +12,23 @@
 #include <chrono>
 #include <obs-websocket-api.h>
 
-
+// Plugin Version Information
+#define PLUGIN_VERSION "1.0.0"
+#define MIN_OBS_VERSION "29.1.0"
 
 // Plugin Metadata
 OBS_DECLARE_MODULE();
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-replay-plugin", "en-US");
 MODULE_EXPORT const char *obs_module_description(void) {
     return "Replay Plugin: Caches the last 30 seconds of each scene, creates a replay scene, and replays footage dynamically on demand via OBS WebSocket.";
+}
+
+MODULE_EXPORT const char *obs_module_version(void) {
+    return PLUGIN_VERSION;
+}
+
+MODULE_EXPORT const char *obs_module_name(void) {
+    return "obs-replay-plugin";
 }
 
 // Circular buffer for caching frames
@@ -375,9 +385,11 @@ obs_properties_t *obs_replay_plugin_properties(void *unused) {
 
 // Plugin Initialization
 bool obs_module_load(void) {
-    blog(LOG_INFO, "OBS Replay Plugin Loaded");
+    blog(LOG_INFO, "Loading OBS Replay Plugin version %s", PLUGIN_VERSION);
+    blog(LOG_INFO, "Required OBS version: %s", MIN_OBS_VERSION);
 
     output_directory = obs_module_config_path(NULL);
+    blog(LOG_INFO, "Output directory set to: %s", output_directory.c_str());
 
     // Create Replay Scene
     create_replay_scene_and_source();
@@ -387,13 +399,29 @@ bool obs_module_load(void) {
 
     // Register WebSocket vendor and callbacks
     obs_websocket_vendor vendor = obs_websocket_register_vendor("replay-plugin");
+    if (!vendor) {
+        blog(LOG_ERROR, "Failed to register WebSocket vendor");
+        return false;
+    }
     
-    obs_websocket_vendor_register_request(vendor, "ReplayScene", 
-        (obs_websocket_request_callback_function)on_replay_request, nullptr);
-    obs_websocket_vendor_register_request(vendor, "SaveAllReplays", 
-        (obs_websocket_request_callback_function)on_save_all_replays, nullptr);
+    blog(LOG_INFO, "WebSocket vendor registered successfully");
 
-    // Add tools menu item with properties dialog
+    // Register WebSocket callbacks
+    if (!obs_websocket_vendor_register_request(vendor, "ReplayScene", 
+        (obs_websocket_request_callback_function)on_replay_request, nullptr)) {
+        blog(LOG_ERROR, "Failed to register ReplayScene callback");
+        return false;
+    }
+
+    if (!obs_websocket_vendor_register_request(vendor, "SaveAllReplays", 
+        (obs_websocket_request_callback_function)on_save_all_replays, nullptr)) {
+        blog(LOG_ERROR, "Failed to register SaveAllReplays callback");
+        return false;
+    }
+
+    blog(LOG_INFO, "WebSocket callbacks registered successfully");
+
+    // Add tools menu item
     obs_frontend_add_tools_menu_item("Replay Plugin", 
         [](void*) {
             obs_source_t* source = obs_get_source_by_name(replay_source_name.c_str());
@@ -404,6 +432,7 @@ bool obs_module_load(void) {
         }, 
         nullptr);
 
+    blog(LOG_INFO, "OBS Replay Plugin loaded successfully");
     return true;
 }
 
