@@ -1,7 +1,5 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
-#include <obs-websocket.h>
-#include <obs-util.h>
 #include <memory>
 #include <deque>
 #include <map>
@@ -12,8 +10,9 @@
 #include <set>
 #include <thread>
 #include <chrono>
-#include <obs-timer.h>
-#include <obs-output.h>
+#include <obs-websocket-api.h>
+
+
 
 // Plugin Metadata
 OBS_DECLARE_MODULE();
@@ -27,6 +26,8 @@ struct FrameBuffer {
     std::deque<std::shared_ptr<obs_source_frame>> video_frames;
     std::deque<std::shared_ptr<obs_source_audio>> audio_frames;
     size_t max_frames;
+
+    FrameBuffer() : max_frames(0) {}
 
     FrameBuffer(size_t max_seconds, int fps) {
         max_frames = max_seconds * fps;
@@ -89,30 +90,34 @@ std::string get_error_log_text() {
     return error_text;
 }
 
+// Helper function to enumerate sources
+void enumerate_sources(std::function<void(obs_source_t*)> callback) {
+    auto enum_proc = [](void* param, obs_source_t* source) -> bool {
+        auto cb = static_cast<std::function<void(obs_source_t*)>*>(param);
+        (*cb)(source);
+        return true;
+    };
+    
+    std::function<void(obs_source_t*)> cb = callback;
+    obs_enum_sources(enum_proc, &cb);
+}
+
 // Update scene buffers based on the active group
 void update_scene_buffers() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
-
-    // Clear all scene buffers
     scene_buffers.clear();
 
     if (current_group.empty() || scene_groups.find(current_group) == scene_groups.end()) {
         log_error("No active group or group not found. Monitoring all scenes.");
 
-        // Fallback: Monitor all scenes
-        obs_source_list_t *sources = obs_enum_sources();
-        if (sources) {
-            for (size_t i = 0; i < sources->num; ++i) {
-                obs_source_t *source = sources->sources[i];
-                if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE) {
-                    const char *scene_name = obs_source_get_name(source);
-                    if (scene_name) {
-                        scene_buffers[scene_name] = FrameBuffer(30, 60); // 30 seconds buffer
-                    }
+        enumerate_sources([](obs_source_t* source) {
+            if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE) {
+                const char* scene_name = obs_source_get_name(source);
+                if (scene_name) {
+                    scene_buffers[scene_name] = FrameBuffer(30, 60);
                 }
             }
-            obs_source_list_release(sources);
-        }
+        });
         return;
     }
 
@@ -147,40 +152,46 @@ void capture_audio_frames(obs_source_t *source, obs_source_audio *audio) {
 
 // Start capturing audio
 void start_audio_capture() {
-    obs_source_list_t *sources = obs_enum_sources();
-    if (sources) {
-        for (size_t i = 0; i < sources->num; ++i) {
-            obs_source_t *source = sources->sources[i];
-            if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
-                obs_source_add_audio_capture_callback(source, capture_audio_frames, nullptr);
-            }
+    enumerate_sources([](obs_source_t* source) {
+        if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
+            obs_source_add_audio_capture_callback(
+                source,
+                [](void* param, obs_source_t* source, const audio_data* audio, bool muted) {
+                    (void)param;  // Mark as intentionally unused
+                    (void)audio;  // Mark as intentionally unused
+                    if (!muted) {
+                        obs_source_audio audio_data = {};
+                        capture_audio_frames(source, &audio_data);
+                    }
+                },
+                nullptr
+            );
         }
-        obs_source_list_release(sources);
-    }
+    });
 }
 
 // Create Replay Scene and Source
 void create_replay_scene_and_source() {
-    obs_source_t *replay_scene = obs_scene_create(replay_scene_name.c_str());
-    if (!replay_scene) {
+    obs_scene_t* scene = obs_scene_create(replay_scene_name.c_str());
+    if (!scene) {
         log_error("Failed to create replay scene.");
         return;
     }
 
-    obs_scene_t *scene_data = obs_scene_from_source(replay_scene);
-    obs_source_t *replay_source = obs_source_create("transition", replay_source_name.c_str(), nullptr, nullptr);
+    obs_source_t* scene_source = obs_scene_get_source(scene);
+    obs_scene_t* scene_data = obs_scene_from_source(scene_source);
+    obs_source_t* replay_source = obs_source_create("ffmpeg_source", 
+                                                  replay_source_name.c_str(), 
+                                                  nullptr, 
+                                                  nullptr);
 
     if (!replay_source) {
         log_error("Failed to create replay source.");
-        obs_source_release(replay_scene);
         return;
     }
 
     obs_scene_add(scene_data, replay_source);
     obs_source_release(replay_source);
-    obs_source_release(replay_scene);
-
-    blog(LOG_INFO, "Replay scene and source created successfully.");
 }
 
 // Switch Scenes
@@ -233,12 +244,11 @@ void play_cached_frames(const std::string &scene_name) {
 
 // Save frames to file
 void save_frames_to_file(const std::string &scene_name, 
-                         const std::vector<std::shared_ptr<obs_source_frame>> &video_frames, 
-                         const std::vector<std::shared_ptr<obs_source_audio>> &audio_frames) {
-    // Determine file path
+                        const std::vector<std::shared_ptr<obs_source_frame>> &video_frames, 
+                        const std::vector<std::shared_ptr<obs_source_audio>> &audio_frames) {
     std::string file_path = output_directory + "/" + scene_name + "_replay.mp4";
 
-    obs_output_t *output = obs_output_create("ffmpeg_output", file_path.c_str(), nullptr, nullptr);
+    obs_output_t *output = obs_output_create("ffmpeg_muxer", "replay_output", nullptr, nullptr);
     if (!output) {
         log_error("Failed to create output for scene: " + scene_name);
         return;
@@ -247,23 +257,30 @@ void save_frames_to_file(const std::string &scene_name,
     // Configure output settings
     obs_data_t *settings = obs_data_create();
     obs_data_set_string(settings, "path", file_path.c_str());
+    obs_data_set_string(settings, "format_name", "mp4");
+    obs_data_set_string(settings, "video_encoder", "h264");
+    obs_data_set_string(settings, "audio_encoder", "aac");
     obs_output_update(output, settings);
     obs_data_release(settings);
 
+    // Start output
     if (!obs_output_start(output)) {
         log_error("Failed to start output for scene: " + scene_name);
         obs_output_release(output);
         return;
     }
 
-    // Write video and audio frames
+    // Process frames
     for (size_t i = 0; i < video_frames.size(); ++i) {
         if (i < audio_frames.size() && audio_frames[i]) {
-            obs_output_audio(output, audio_frames[i].get());
+            obs_source_output_audio(obs_get_source_by_name(replay_source_name.c_str()), 
+                                  audio_frames[i].get());
         }
         if (video_frames[i]) {
-            obs_output_video(output, video_frames[i].get());
+            obs_source_output_video(obs_get_source_by_name(replay_source_name.c_str()), 
+                                  video_frames[i].get());
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
     }
 
     obs_output_stop(output);
@@ -295,43 +312,51 @@ void play_replay_and_return(const std::string &scene_name) {
     switch_to_scene(previous_scene_name);
 }
 
-// WebSocket Command Handler
-void on_websocket_command(const char *command, const char *scene_name) {
-    if (strcmp(command, "replay_scene") == 0) {
-        std::thread(play_replay_and_return, scene_name).detach(); // Run replay in a separate thread
+// WebSocket callback definitions
+static void on_replay_request(obs_data_t* request_data, obs_data_t* response_data, void* priv_data) {
+    (void)priv_data;  // Mark as intentionally unused
+    const char* scene_name = obs_data_get_string(request_data, "scene");
+    if (scene_name) {
+        std::thread(play_replay_and_return, std::string(scene_name)).detach();
+        obs_data_set_bool(response_data, "success", true);
+    } else {
+        obs_data_set_bool(response_data, "success", false);
+        obs_data_set_string(response_data, "error", "No scene name provided");
     }
 }
 
-// WebSocket Command: Save all replays
-void on_save_all_replays_command(const char *command, const char *args) {
+static void on_save_all_replays(obs_data_t* request_data, obs_data_t* response_data, void* priv_data) {
+    (void)priv_data;  // Mark as intentionally unused
+    (void)request_data;  // Mark as intentionally unused
+    
     std::lock_guard<std::mutex> lock(buffer_mutex);
-
-    for (auto &buffer_pair : scene_buffers) {
-        const std::string &scene_name = buffer_pair.first;
-        const auto &video_frames = buffer_pair.second.get_video_frames();
-        const auto &audio_frames = buffer_pair.second.get_audio_frames();
-        if (video_frames.empty() || audio_frames.empty()) {
-            log_error("No cached frames for scene: " + scene_name);
-            continue;
+    for (auto& buffer_pair : scene_buffers) {
+        const std::string& scene_name = buffer_pair.first;
+        auto video_frames = buffer_pair.second.get_video_frames();
+        auto audio_frames = buffer_pair.second.get_audio_frames();
+        if (!video_frames.empty() && !audio_frames.empty()) {
+            save_frames_to_file(scene_name, video_frames, audio_frames);
         }
-        save_frames_to_file(scene_name, video_frames, audio_frames);
     }
-
-    blog(LOG_INFO, "Saved replays for all scenes.");
+    obs_data_set_bool(response_data, "success", true);
 }
 
 // Add Option to Set Output Directory in Tools Menu
-static void set_output_directory(obs_properties_t *props, obs_property_t *property, void *data) {
-    obs_data_t *settings = obs_frontend_get_properties_settings();
-    const char *new_output_dir = obs_data_get_string(settings, "output_directory");
+static bool set_output_directory(obs_properties_t *props, 
+                               obs_property_t *property, 
+                               obs_data_t *settings) {
+    (void)props;    // Mark as intentionally unused
+    (void)property; // Mark as intentionally unused
+    const char* new_output_dir = obs_data_get_string(settings, "output_directory");
     if (new_output_dir) {
         output_directory = std::string(new_output_dir);
         blog(LOG_INFO, "Output directory set to: %s", output_directory.c_str());
     }
-    obs_data_release(settings);
+    return true;
 }
 
 obs_properties_t *obs_replay_plugin_properties(void *unused) {
+    (void)unused;  // Mark as intentionally unused
     obs_properties_t *props = obs_properties_create();
 
     // Enable/Disable Toggle
@@ -352,7 +377,7 @@ obs_properties_t *obs_replay_plugin_properties(void *unused) {
 bool obs_module_load(void) {
     blog(LOG_INFO, "OBS Replay Plugin Loaded");
 
-    output_directory = obs_module_config_path(NULL); // Default to OBS config path
+    output_directory = obs_module_config_path(NULL);
 
     // Create Replay Scene
     create_replay_scene_and_source();
@@ -360,18 +385,31 @@ bool obs_module_load(void) {
     // Start Audio Capture
     start_audio_capture();
 
-    // Register WebSocket Commands
-    obs_websocket_register_command("replay_scene", on_websocket_command);
-    obs_websocket_register_command("save_all_replays", on_save_all_replays_command);
+    // Register WebSocket vendor and callbacks
+    obs_websocket_vendor vendor = obs_websocket_register_vendor("replay-plugin");
+    
+    obs_websocket_vendor_register_request(vendor, "ReplayScene", 
+        (obs_websocket_request_callback_function)on_replay_request, nullptr);
+    obs_websocket_vendor_register_request(vendor, "SaveAllReplays", 
+        (obs_websocket_request_callback_function)on_save_all_replays, nullptr);
 
-    // Add Tools Menu
-    obs_frontend_add_tools_menu_entry("Replay Plugin", obs_replay_plugin_properties);
+    // Add tools menu item with properties dialog
+    obs_frontend_add_tools_menu_item("Replay Plugin", 
+        [](void*) {
+            obs_source_t* source = obs_get_source_by_name(replay_source_name.c_str());
+            if (source) {
+                obs_frontend_open_source_properties(source);
+                obs_source_release(source);
+            }
+        }, 
+        nullptr);
 
     return true;
 }
 
 // Plugin Unload
 void obs_module_unload(void) {
+    // Note: No need to unregister vendor - OBS handles this automatically
     scene_buffers.clear();
     blog(LOG_INFO, "OBS Replay Plugin Unloaded");
 }
