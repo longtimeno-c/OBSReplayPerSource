@@ -96,3 +96,8 @@ For issues, please open a ticket in the GitHub repository or contact the maintai
 ---
 
 Enjoy seamless replay functionality with the OBS Replay Plugin!
+
+
+Build:
+`cmake --build . --config Debug`
+`cmake --build . --config Release   `
