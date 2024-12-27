@@ -99,5 +99,13 @@ Enjoy seamless replay functionality with the OBS Replay Plugin!
 
 
 Build:
-`cmake --build . --config Debug`
-`cmake --build . --config Release   `
+Mac:
+```
+cmake -G Xcode -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_BUILD_TYPE=Release ..
+```
+```
+cmake --build . --config Debug
+```
+```
+cmake --build . --config Release
+```
