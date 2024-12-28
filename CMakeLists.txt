@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.28...3.30)
 project(obs-replay-plugin)
 
 add_library(obs-replay-plugin MODULE
@@ -11,7 +11,8 @@ target_link_libraries(
   obs-replay-plugin
   PRIVATE OBS::libobs
           OBS::frontend-api
-          OBS::websocket-api)
+          OBS::websocket-api
+          Qt6::Widgets)
 
 # Optional: Tidy up folder name and omit 'lib' prefix
 set_target_properties(obs-replay-plugin
