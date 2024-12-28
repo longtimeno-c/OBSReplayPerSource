@@ -1,5 +1,6 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
+#include <obs-source.h>
 #include <obs-websocket-api.h>
 
 #include <memory>
@@ -46,7 +47,10 @@ MODULE_EXPORT const char *obs_module_name(void)
 	return "obs-replay-plugin";
 }
 
+bool plugin_enabled = true;
+
 // Forward declarations
+static std::mutex buffer_mutex;
 static void replay_source_destroy(void *data);
 static void replay_source_render(void *data, gs_effect_t *effect);
 void enumerate_sources(std::function<void(obs_source_t *)> callback);
@@ -64,12 +68,17 @@ struct FrameBuffer {
 	FrameBuffer(size_t max_seconds, int fps) : max_frames(max_seconds * fps) {}
 
 	~FrameBuffer() {
+		clear();
+	}
+
+	void clear() {
 		// Clean up video frames
 		for (auto &frame : video_frames) {
 			if (frame) {
 				for (size_t i = 0; i < MAX_AV_PLANES; i++) {
 					if (frame->data[i]) {
 						bfree((void*)frame->data[i]);
+						frame->data[i] = nullptr;
 					}
 				}
 			}
@@ -82,6 +91,7 @@ struct FrameBuffer {
 				for (size_t i = 0; i < MAX_AV_PLANES; i++) {
 					if (frame->data[i]) {
 						bfree((void*)frame->data[i]);
+						frame->data[i] = nullptr;
 					}
 				}
 			}
@@ -89,25 +99,90 @@ struct FrameBuffer {
 		audio_frames.clear();
 	}
 
-	void add_audio_frame(std::shared_ptr<obs_source_audio> frame);
-	void add_video_frame(std::shared_ptr<obs_source_frame> frame);
-	std::vector<std::shared_ptr<obs_source_frame>> get_video_frames();
-	std::vector<std::shared_ptr<obs_source_audio>> get_audio_frames();
+	void add_video_frame(std::shared_ptr<obs_source_frame> frame) {
+		if (!plugin_enabled) {
+			blog(LOG_DEBUG, "Plugin is disabled; skipping frame addition.");
+			return;
+		}
+		if (!frame) {
+			blog(LOG_WARNING, "Received null frame; skipping.");
+			return;
+		}
+
+		std::lock_guard<std::mutex> lock(buffer_mutex);
+		blog(LOG_DEBUG, "Adding frame - Width: %d, Height: %d, Format: %d", 
+			frame->width, frame->height, frame->format);
+
+		if (video_frames.size() >= max_frames) {
+			blog(LOG_INFO, "Buffer is full; removing oldest frame.");
+			auto oldest = video_frames.front();
+			if (oldest) {
+				for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+					if (oldest->data[i]) {
+						bfree((void*)oldest->data[i]);
+						oldest->data[i] = nullptr;
+					}
+				}
+			}
+			video_frames.pop_front();
+		}
+
+		if (frame->width > 0 && frame->height > 0) {
+			video_frames.push_back(frame);
+			blog(LOG_DEBUG, "Added frame to buffer. New buffer size: %zu", video_frames.size());
+		} else {
+			blog(LOG_WARNING, "Invalid frame dimensions: width=%d, height=%d; skipping.", frame->width, frame->height);
+		}
+	}
+
+	// Similar cleanup for add_audio_frame
+	void add_audio_frame(std::shared_ptr<obs_source_audio> frame) {
+		if (!plugin_enabled || !frame)
+			return;
+
+		if (audio_frames.size() >= max_frames) {
+			// Clean up the oldest frame before removing it
+			auto oldest = audio_frames.front();
+			if (oldest) {
+				for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+					if (oldest->data[i]) {
+						bfree((void*)oldest->data[i]);
+					}
+				}
+			}
+			audio_frames.pop_front();
+		}
+		audio_frames.push_back(frame);
+	}
+
+	std::vector<std::shared_ptr<obs_source_frame>> get_video_frames()
+	{
+		return std::vector<std::shared_ptr<obs_source_frame>>(video_frames.begin(), video_frames.end());
+	}
+
+	std::vector<std::shared_ptr<obs_source_audio>> get_audio_frames()
+	{
+		return std::vector<std::shared_ptr<obs_source_audio>>(audio_frames.begin(), audio_frames.end());
+	}
 };
 
 // Global variables and mutexes
-static std::mutex buffer_mutex;
 static std::map<std::string, FrameBuffer> scene_buffers;
 static std::string output_directory;
-static std::string replay_scene_name = "Replay Scene";
-static std::string replay_source_name = "ReplaySource";
+static const char *REPLAY_SCENE_NAME = "Replay";
+static const char *REPLAY_SOURCE_NAME = "ReplaySource";
 static std::string previous_scene_name;
 static std::string current_group;
 static std::map<std::string, std::vector<std::string>> scene_groups; // Group to scene mapping
 static std::deque<std::string> error_log;
 static const size_t max_errors = 10;
 static obs_source_t *replay_source = nullptr;
-static bool plugin_enabled = false;
+
+// Add these near the top with other global variables
+static std::set<obs_source_t*> monitored_sources;
+static void set_plugin_enabled(bool enabled);
+static void stop_video_capture();
+static void stop_audio_capture();
 
 // Define the source info structure
 static struct obs_source_info replay_source_info = {.id = "replay_capture",
@@ -120,70 +195,6 @@ static struct obs_source_info replay_source_info = {.id = "replay_capture",
 						    },
 						    .destroy = replay_source_destroy,
 						    .video_render = replay_source_render};
-
-// Implementation of FrameBuffer methods
-void FrameBuffer::add_audio_frame(std::shared_ptr<obs_source_audio> frame)
-{
-	if (!plugin_enabled)
-		return;
-
-	if (audio_frames.size() >= max_frames) {
-		audio_frames.pop_front();
-	}
-	audio_frames.push_back(frame);
-	blog(LOG_DEBUG, "Audio frame added. Buffer size: %zu/%zu", audio_frames.size(), max_frames);
-}
-
-void FrameBuffer::add_video_frame(std::shared_ptr<obs_source_frame> frame)
-{
-	if (!plugin_enabled)
-		return;
-
-	if (video_frames.size() >= max_frames) {
-		video_frames.pop_front();
-	}
-	video_frames.push_back(frame);
-	blog(LOG_DEBUG, "Video frame added. Buffer size: %zu/%zu", video_frames.size(), max_frames);
-}
-
-std::vector<std::shared_ptr<obs_source_frame>> FrameBuffer::get_video_frames()
-{
-	return std::vector<std::shared_ptr<obs_source_frame>>(video_frames.begin(), video_frames.end());
-}
-
-std::vector<std::shared_ptr<obs_source_audio>> FrameBuffer::get_audio_frames()
-{
-	return std::vector<std::shared_ptr<obs_source_audio>>(audio_frames.begin(), audio_frames.end());
-}
-
-static void replay_source_destroy(void *data)
-{
-	UNUSED_PARAMETER(data);
-	blog(LOG_DEBUG, "Replay source destroyed");
-}
-
-static void replay_source_render(void *data, gs_effect_t *effect)
-{
-	UNUSED_PARAMETER(effect);
-
-	obs_source_t *target = (obs_source_t *)data;
-	obs_source_video_render(target);
-
-	// Capture frame data here
-	uint32_t width = obs_source_get_width(target);
-	uint32_t height = obs_source_get_height(target);
-
-	if (width && height) {
-		const char *source_name = obs_source_get_name(target);
-		std::lock_guard<std::mutex> lock(buffer_mutex);
-		auto it = scene_buffers.find(source_name);
-		if (it != scene_buffers.end()) {
-			auto video_frame = std::make_shared<obs_source_frame>();
-			// ... frame capture logic ...
-			it->second.add_video_frame(video_frame);
-		}
-	}
-}
 
 // Helper Function: Add error to log
 void log_error(const std::string &message)
@@ -216,7 +227,7 @@ void release_replay_source()
 		enumerate_sources([](obs_source_t *source) {
 			if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE) {
 				obs_scene_t *scene = obs_scene_from_source(source);
-				obs_sceneitem_t *item = obs_scene_find_source(scene, replay_source_name.c_str());
+				obs_sceneitem_t *item = obs_scene_find_source(scene, REPLAY_SOURCE_NAME);
 				if (item) {
 					obs_sceneitem_remove(item);
 				}
@@ -232,6 +243,9 @@ void release_replay_source()
 void clear_scene_buffers()
 {
 	std::lock_guard<std::mutex> lock(buffer_mutex);
+	for (auto &buffer : scene_buffers) {
+		buffer.second.clear();
+	}
 	scene_buffers.clear();
 }
 
@@ -263,7 +277,7 @@ void update_scene_buffers()
 			const char *scene_name = obs_source_get_name(source);
 			if (scene_name) {
 				scene_buffers[scene_name] = FrameBuffer(30, 60); // 30 seconds at 60 FPS
-				blog(LOG_INFO, "Monitoring scene: %s", scene_name);
+				blog(LOG_INFO, "Created buffer for scene: %s", scene_name);
 			}
 		}
 	});
@@ -298,9 +312,17 @@ void capture_audio_frames(obs_source_t *source, obs_source_audio *audio)
 // Start capturing audio
 void start_audio_capture()
 {
+	blog(LOG_INFO, "Starting audio capture...");
+	
 	enumerate_sources([](obs_source_t *source) {
-		if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
-			obs_source_add_audio_capture_callback(source, audio_callback, nullptr);
+		uint32_t caps = obs_source_get_output_flags(source);
+		if (caps & OBS_SOURCE_AUDIO) {
+			const char *source_name = obs_source_get_name(source);
+			if (source_name && strcmp(source_name, REPLAY_SOURCE_NAME) != 0) {
+				// Add audio callback
+				obs_source_add_audio_capture_callback(source, audio_callback, nullptr);
+				blog(LOG_INFO, "Added audio capture callback to source: %s", source_name);
+			}
 		}
 	});
 }
@@ -341,99 +363,239 @@ void audio_callback(void *param, obs_source_t *source, const audio_data *audio, 
 	}
 }
 
+// Update the callback signature to match the correct type
+static void raw_video_callback(void *param, struct video_data *frame)
+{
+    UNUSED_PARAMETER(param);
+
+    if (!plugin_enabled) {
+        blog(LOG_DEBUG, "Plugin is disabled, skipping video callback");
+        return;
+    }
+
+    if (!frame) {
+        blog(LOG_WARNING, "Received null frame in video callback");
+        return;
+    }
+
+    blog(LOG_DEBUG, "Raw video callback received frame with timestamp: %llu", frame->timestamp);
+
+    // Get current scene
+    obs_source_t *current_scene = obs_frontend_get_current_scene();
+    if (!current_scene) {
+        blog(LOG_WARNING, "No current scene available");
+        return;
+    }
+
+    const char *scene_name = obs_source_get_name(current_scene);
+    if (!scene_name) {
+        blog(LOG_WARNING, "Could not get scene name");
+        obs_source_release(current_scene);
+        return;
+    }
+
+    blog(LOG_DEBUG, "Processing frame for scene: %s", scene_name);
+
+    // Get video output info with more detailed logging
+    video_t *video = obs_get_video();
+    if (!video) {
+        blog(LOG_ERROR, "Failed to get video context");
+        obs_source_release(current_scene);
+        return;
+    }
+
+    const struct video_output_info *voi = video_output_get_info(video);
+    if (!voi) {
+        blog(LOG_ERROR, "Failed to get video output info");
+        obs_source_release(current_scene);
+        return;
+    }
+
+    blog(LOG_DEBUG, "Video info - Width: %d, Height: %d, Format: %d", 
+        voi->width, voi->height, voi->format);
+
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    auto it = scene_buffers.find(scene_name);
+    if (it == scene_buffers.end()) {
+        blog(LOG_DEBUG, "Creating new buffer for scene: %s", scene_name);
+        scene_buffers[scene_name] = FrameBuffer(30, 60); // 30 seconds at 60 FPS
+        it = scene_buffers.find(scene_name);
+    }
+
+    // Create and populate the video frame
+    auto video_frame = std::make_shared<obs_source_frame>();
+    video_frame->width = voi->width;
+    video_frame->height = voi->height;
+    video_frame->format = voi->format;
+    video_frame->timestamp = frame->timestamp;
+
+    // Calculate sizes for each plane
+    size_t plane_sizes[MAX_AV_PLANES] = {0};
+    for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+        if (frame->linesize[i] > 0) {
+            plane_sizes[i] = frame->linesize[i] * voi->height;
+            if (i > 0 && voi->format == VIDEO_FORMAT_I420) {
+                plane_sizes[i] = plane_sizes[i] / 2; // UV planes are quarter size
+            }
+        }
+    }
+
+    // Copy frame data
+    bool copy_success = true;
+    for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+        if (frame->data[i] && plane_sizes[i] > 0) {
+            video_frame->data[i] = (uint8_t *)bmemdup(frame->data[i], plane_sizes[i]);
+            video_frame->linesize[i] = frame->linesize[i];
+            
+            if (!video_frame->data[i]) {
+                blog(LOG_ERROR, "Failed to allocate memory for plane %zu", i);
+                copy_success = false;
+                break;
+            }
+        } else {
+            video_frame->data[i] = nullptr;
+            video_frame->linesize[i] = 0;
+        }
+    }
+
+    if (copy_success) {
+        it->second.add_video_frame(video_frame);
+        blog(LOG_DEBUG, "Successfully added frame to buffer for scene '%s' (Buffer size: %zu)", 
+            scene_name, it->second.video_frames.size());
+    } else {
+        // Clean up on failure
+        for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+            if (video_frame->data[i]) {
+                bfree(video_frame->data[i]);
+            }
+        }
+    }
+
+    obs_source_release(current_scene);
+}
+
+
 void start_video_capture()
 {
-	// Create the replay source if it doesn't exist
-	if (!replay_source) {
-		obs_data_t *settings = obs_data_create();
-		replay_source = obs_source_create("replay_capture", "ReplayCapture", settings, nullptr);
-		obs_data_release(settings);
-	}
+    blog(LOG_INFO, "Starting video capture...");
+    
+    // Get current video context and info for validation
+    video_t *video = obs_get_video();
+    if (!video) {
+        blog(LOG_ERROR, "Failed to get video context when starting capture");
+        return;
+    }
 
-	enumerate_sources([](obs_source_t *source) {
-		if (obs_source_get_output_flags(source) & OBS_SOURCE_VIDEO) {
-			// Add the filter if it's not already added
-			obs_source_t *existing_filter = obs_source_get_filter_by_name(source, "ReplayCapture");
-			if (!existing_filter) {
-				obs_source_filter_add(source, replay_source);
-				blog(LOG_INFO, "Added video capture filter to source: %s", obs_source_get_name(source));
-			} else {
-				obs_source_release(existing_filter);
-			}
-		}
-	});
+    const struct video_output_info *voi = video_output_get_info(video);
+    if (!voi) {
+        blog(LOG_ERROR, "Failed to get video output info when starting capture");
+        return;
+    }
+
+    blog(LOG_INFO, "Video capture starting with resolution %dx%d", voi->width, voi->height);
+    obs_add_raw_video_callback(NULL, raw_video_callback, NULL);
+    blog(LOG_INFO, "Raw video callback registered successfully");
+}
+
+void stop_video_capture()
+{
+	blog(LOG_INFO, "Stopping video capture...");
+	obs_remove_raw_video_callback(raw_video_callback, nullptr);
 }
 
 void video_render_callback(void *param, obs_source_t *source, const struct video_data *frame)
 {
-	if (!plugin_enabled || !frame)
+	UNUSED_PARAMETER(param);
+	
+	if (!plugin_enabled || !frame || !source)
 		return;
 
 	const char *source_name = obs_source_get_name(source);
+	if (!source_name) return;
+
+	blog(LOG_DEBUG, "Capturing frame from source: %s", source_name);
+
 	std::lock_guard<std::mutex> lock(buffer_mutex);
 	auto it = scene_buffers.find(source_name);
 	if (it != scene_buffers.end()) {
 		auto video_frame = std::make_shared<obs_source_frame>();
 		
-		// Get dimensions from the source instead
-		obs_source_t *target = (obs_source_t *)param;
-		video_frame->width = obs_source_get_width(target);
-		video_frame->height = obs_source_get_height(target);
-		video_frame->timestamp = frame->timestamp;
+		// Get source info for dimensions
+		uint32_t width = obs_source_get_width(source);
+		uint32_t height = obs_source_get_height(source);
 		
-		// Allocate and copy data for each plane
-		for (size_t i = 0; i < MAX_AV_PLANES; i++) {
-			if (frame->data[i]) {
-				const size_t plane_size = frame->linesize[i] * video_frame->height;
-				video_frame->data[i] = (uint8_t *)bmemdup(frame->data[i], plane_size);
-				video_frame->linesize[i] = frame->linesize[i];
-			} else {
-				video_frame->data[i] = nullptr;
-				video_frame->linesize[i] = 0;
-			}
+		if (width == 0 || height == 0) {
+			blog(LOG_ERROR, "Invalid source dimensions: %dx%d", width, height);
+			return;
 		}
 
+		// Copy frame properties
+		video_frame->width = width;
+		video_frame->height = height;
+		video_frame->timestamp = frame->timestamp;
+		video_frame->format = VIDEO_FORMAT_I420;
+
+		// Calculate proper plane sizes
+		size_t y_size = width * height;
+		size_t u_size = (width/2) * (height/2);
+		size_t v_size = u_size;
+
+		// Allocate and copy data for each plane
+		video_frame->data[0] = (uint8_t *)bmemdup(frame->data[0], y_size);
+		video_frame->data[1] = (uint8_t *)bmemdup(frame->data[1], u_size);
+		video_frame->data[2] = (uint8_t *)bmemdup(frame->data[2], v_size);
+		video_frame->linesize[0] = width;
+		video_frame->linesize[1] = width/2;
+		video_frame->linesize[2] = width/2;
+
 		it->second.add_video_frame(video_frame);
-		blog(LOG_DEBUG, "Captured video frame for source: %s (Buffer size: %zu)", 
+		blog(LOG_DEBUG, "Added frame to buffer for source: %s (Buffer size: %zu)", 
 			 source_name, it->second.video_frames.size());
 	}
 }
 
-// Create Replay Scene and Source
-void create_replay_scene_and_source()
-{
-	if (replay_source) {
-		blog(LOG_INFO, "Replay source already exists, skipping creation.");
-		return;
-	}
-
-	// First, remove any existing replay scenes
-	obs_source_t *existing_scene = obs_get_source_by_name(replay_scene_name.c_str());
+// Function to create replay scene and source when needed
+bool create_replay_scene_and_source() {
+	// Check if scene already exists
+	obs_source_t *existing_scene = obs_get_source_by_name(REPLAY_SCENE_NAME);
 	if (existing_scene) {
-		obs_source_remove(existing_scene);
 		obs_source_release(existing_scene);
+		return true;
 	}
 
-	blog(LOG_INFO, "Creating replay scene and source...");
-	obs_scene_t *scene = obs_scene_create(replay_scene_name.c_str());
+	// Create new scene
+	obs_scene_t *scene = obs_scene_create(REPLAY_SCENE_NAME);
 	if (!scene) {
-		log_error("Failed to create replay scene.");
-		return;
+		blog(LOG_ERROR, "Failed to create replay scene");
+		return false;
 	}
 
-	// Create the replay source
+	// Create replay source
 	obs_data_t *settings = obs_data_create();
-	obs_data_set_bool(settings, "is_local_file", false);
-	replay_source = obs_source_create("ffmpeg_source", replay_source_name.c_str(), settings, nullptr);
+	obs_source_t *source = obs_source_create("ffmpeg_source", REPLAY_SOURCE_NAME, settings, nullptr);
 	obs_data_release(settings);
 
-	if (!replay_source) {
-		log_error("Failed to create replay source.");
-		return;
+	if (!source) {
+		obs_scene_release(scene);
+		blog(LOG_ERROR, "Failed to create replay source");
+		return false;
 	}
 
-	obs_scene_add(scene, replay_source);
-	blog(LOG_INFO, "Replay scene and source created successfully.");
+	// Add source to scene
+	obs_sceneitem_t *scene_item = obs_scene_add(scene, source);
+	if (!scene_item) {
+		obs_source_release(source);
+		obs_scene_release(scene);
+		blog(LOG_ERROR, "Failed to add source to scene");
+		return false;
+	}
+
+	// Release references
+	obs_source_release(source);
+	obs_scene_release(scene);
+
+	blog(LOG_INFO, "Successfully created replay scene and source");
+	return true;
 }
 
 // Switch Scenes
@@ -451,48 +613,54 @@ void switch_to_scene(const std::string &scene_name)
 // Play Cached Frames on Replay Source
 void play_cached_frames(const std::string &scene_name)
 {
-	blog(LOG_INFO, "Attempting to play cached frames for scene: %s", scene_name.c_str());
+    blog(LOG_INFO, "Attempting to play cached frames for scene: %s", scene_name.c_str());
 
-	std::lock_guard<std::mutex> lock(buffer_mutex);
-	auto it = scene_buffers.find(scene_name);
-	if (it == scene_buffers.end()) {
-		log_error("No buffer found for scene: " + scene_name);
-		return;
-	}
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    auto it = scene_buffers.find(scene_name);
+    if (it == scene_buffers.end()) {
+        log_error("No buffer found for scene: " + scene_name);
+        return;
+    }
 
-	auto video_frames = it->second.get_video_frames();
-	auto audio_frames = it->second.get_audio_frames();
+    auto video_frames = it->second.get_video_frames();
+    auto audio_frames = it->second.get_audio_frames();
 
-	blog(LOG_INFO, "Found %zu video frames and %zu audio frames", video_frames.size(), audio_frames.size());
+    blog(LOG_INFO, "Retrieved %zu video frames and %zu audio frames", 
+        video_frames.size(), audio_frames.size());
 
-	if (video_frames.empty()) {
-		log_error("No video frames cached for scene: " + scene_name);
-		return;
-	}
+    if (video_frames.empty()) {
+        log_error("No video frames cached for scene: " + scene_name);
+        return;
+    }
 
-	// Obtain the replay source
-	obs_source_t *replay_source = obs_get_source_by_name(replay_source_name.c_str());
-	if (!replay_source) {
-		log_error("Replay source not found.");
-		return;
-	}
+    // Get the replay source with additional logging
+    obs_source_t *replay_source = obs_get_source_by_name(REPLAY_SOURCE_NAME);
+    if (!replay_source) {
+        log_error("Replay source not found");
+        return;
+    }
 
-	blog(LOG_INFO, "Playing %zu video frames and %zu audio frames for scene: %s", video_frames.size(),
-	     audio_frames.size(), scene_name.c_str());
+    blog(LOG_INFO, "Starting playback of %zu frames", video_frames.size());
 
-	// Play frames
-	for (size_t i = 0; i < video_frames.size(); ++i) {
-		if (i < audio_frames.size() && audio_frames[i]) {
-			obs_source_output_audio(replay_source, audio_frames[i].get());
-		}
-		if (video_frames[i]) {
-			obs_source_output_video(replay_source, video_frames[i].get());
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(33)); // Simulate 30fps playback
-	}
+    // Play frames with detailed logging
+    for (size_t i = 0; i < video_frames.size(); ++i) {
+        if (i < audio_frames.size() && audio_frames[i]) {
+            blog(LOG_DEBUG, "Outputting audio frame %zu", i);
+            obs_source_output_audio(replay_source, audio_frames[i].get());
+        }
+        
+        if (video_frames[i]) {
+            blog(LOG_DEBUG, "Outputting video frame %zu - Width: %d, Height: %d", 
+                i, video_frames[i]->width, video_frames[i]->height);
+            obs_source_output_video(replay_source, video_frames[i].get());
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(33)); // ~30fps
+    }
 
-	blog(LOG_INFO, "Finished playing cached frames for scene: %s", scene_name.c_str());
-	obs_source_release(replay_source);
+    blog(LOG_INFO, "Finished playing %zu frames for scene: %s", 
+        video_frames.size(), scene_name.c_str());
+    obs_source_release(replay_source);
 }
 
 // Save frames to file
@@ -527,11 +695,11 @@ void save_frames_to_file(const std::string &scene_name,
 	// Process frames
 	for (size_t i = 0; i < video_frames.size(); ++i) {
 		if (i < audio_frames.size() && audio_frames[i]) {
-			obs_source_output_audio(obs_get_source_by_name(replay_source_name.c_str()),
+			obs_source_output_audio(obs_get_source_by_name(REPLAY_SOURCE_NAME),
 						audio_frames[i].get());
 		}
 		if (video_frames[i]) {
-			obs_source_output_video(obs_get_source_by_name(replay_source_name.c_str()),
+			obs_source_output_video(obs_get_source_by_name(REPLAY_SOURCE_NAME),
 						video_frames[i].get());
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
@@ -553,7 +721,7 @@ void play_replay_and_return(const std::string &scene_name)
 	}
 
 	// Switch to replay scene
-	switch_to_scene(replay_scene_name);
+	switch_to_scene(REPLAY_SCENE_NAME);
 
 	// Play cached frames for the given scene
 	auto it = scene_buffers.find(scene_name);
@@ -683,12 +851,11 @@ void replay_plugin_open_settings(void *)
 	QVBoxLayout *layout = new QVBoxLayout(dialog);
 
 	QCheckBox *enable_checkbox = new QCheckBox("Enable Replay Plugin", dialog);
-	enable_checkbox->setChecked(plugin_enabled); // Pre-fill with the current state
+	enable_checkbox->setChecked(plugin_enabled);
 	layout->addWidget(enable_checkbox);
 
 	QObject::connect(enable_checkbox, &QCheckBox::stateChanged, [=](int state) {
-		plugin_enabled = (state == Qt::Checked);
-		blog(LOG_INFO, "Replay Plugin %s", plugin_enabled ? "enabled" : "disabled");
+		set_plugin_enabled(state == Qt::Checked);
 	});
 
 	QHBoxLayout *path_layout = new QHBoxLayout();
@@ -751,11 +918,64 @@ void on_scene_change(enum obs_frontend_event event, void *private_data)
 	obs_source_release(scene);
 }
 
+// Add this function to handle plugin state changes
+void set_plugin_enabled(bool enabled) {
+	if (plugin_enabled == enabled)
+		return;
+	
+	plugin_enabled = enabled;
+	blog(LOG_INFO, "Replay Plugin %s", enabled ? "enabled" : "disabled");
+
+	if (enabled) {
+		update_scene_buffers();  // This should only create the buffers
+		start_video_capture();   // Start capture separately
+		start_audio_capture();
+	} else {
+		stop_video_capture();
+		stop_audio_capture();
+		clear_scene_buffers();
+	}
+}
+
+void stop_audio_capture()
+{
+	blog(LOG_INFO, "Stopping audio capture...");
+	
+	enumerate_sources([](obs_source_t *source) {
+		if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
+			obs_source_remove_audio_capture_callback(source, audio_callback, nullptr);
+		}
+	});
+}
+
 // Plugin Initialization
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "Loading OBS Replay Plugin version %s", PLUGIN_VERSION);
-	blog(LOG_INFO, "Required OBS version: %s", MIN_OBS_VERSION);
+
+	// Only register the source info once
+	static bool source_registered = false;
+	if (!source_registered) {
+		obs_register_source(&replay_source_info);
+		source_registered = true;
+	}
+	
+	// Create initial replay scene and source
+	if (!create_replay_scene_and_source()) {
+		blog(LOG_ERROR, "Failed to create replay scene and source");
+		return false;
+	}
+
+	// Initialize scene buffers
+	update_scene_buffers();
+	
+	// Start capture only after successful initialization
+	if (plugin_enabled) {
+		start_video_capture();
+		start_audio_capture();
+	}
+	// Create initial replay scene and source
+	create_replay_scene_and_source();
 
 	// Load settings
 	obs_data_t *settings = obs_get_private_data();
@@ -768,10 +988,6 @@ bool obs_module_load(void)
 		blog(LOG_INFO, "Using default output directory: %s", output_directory.c_str());
 	}
 	obs_data_release(settings);
-
-	// Start Video + Audio Capture
-	start_video_capture();
-	start_audio_capture();
 
 	// Register WebSocket vendor and callbacks
 	obs_websocket_vendor vendor = obs_websocket_register_vendor("replay-plugin");
@@ -803,25 +1019,7 @@ bool obs_module_load(void)
 
 	blog(LOG_INFO, "Replay Plugin and Test Tools added to Tools menu.");
 
-	// Set up source info
-	replay_source_info.id = "replay_capture";
-	replay_source_info.type = OBS_SOURCE_TYPE_FILTER;
-	replay_source_info.output_flags = OBS_SOURCE_VIDEO;
-	replay_source_info.get_name = [](void *) {
-		return "Replay Capture";
-	};
-	replay_source_info.create = [](obs_data_t *settings, obs_source_t *source) {
-		UNUSED_PARAMETER(settings);
-		return (void *)source;
-	};
-	replay_source_info.destroy = replay_source_destroy;
-	replay_source_info.video_render = replay_source_render;
-
-	// Register scene change callback
-	obs_frontend_add_event_callback(on_scene_change, nullptr);
-
-	// Register the source info
-	obs_register_source(&replay_source_info);
+	set_plugin_enabled(true);  // Enable the plugin by default
 
 	return true;
 }
@@ -829,17 +1027,57 @@ bool obs_module_load(void)
 // Plugin Unload
 void obs_module_unload(void)
 {
+	set_plugin_enabled(false);  // Disable and clean up
+
+	// Remove event callback first
+	obs_frontend_remove_event_callback(on_scene_change, nullptr);
+
+	// Clear all buffers first
+	{
+		std::lock_guard<std::mutex> lock(buffer_mutex);
+		scene_buffers.clear();
+	}
+
+	// Release the replay source properly
 	if (replay_source) {
-		release_replay_source();
+		// Remove from any scenes first
+		enumerate_sources([](obs_source_t *source) {
+			if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE) {
+				obs_scene_t *scene = obs_scene_from_source(source);
+				obs_sceneitem_t *item = obs_scene_find_source(scene, REPLAY_SOURCE_NAME);
+				if (item) {
+					obs_sceneitem_remove(item);
+				}
+			}
+		});
+
+		obs_source_remove(replay_source); // Mark source for removal
+		obs_source_release(replay_source);
+		replay_source = nullptr;
 	}
 
 	// Remove the replay scene if it exists
-	obs_source_t *replay_scene = obs_get_source_by_name(replay_scene_name.c_str());
+	obs_source_t *replay_scene = obs_get_source_by_name(REPLAY_SCENE_NAME);
 	if (replay_scene) {
-		blog(LOG_INFO, "Removing replay scene.");
+		obs_source_remove(replay_scene);
 		obs_source_release(replay_scene);
 	}
 
-	clear_scene_buffers();
 	blog(LOG_INFO, "OBS Replay Plugin Unloaded");
+}
+
+static void replay_source_destroy(void *data)
+{
+	UNUSED_PARAMETER(data);
+	// Any cleanup needed when the source is destroyed
+	blog(LOG_INFO, "Replay source destroyed");
+}
+
+static void replay_source_render(void *data, gs_effect_t *effect)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(effect);
+	// This function is called when the source needs to be rendered
+	// For now, we'll leave it empty as we're handling rendering elsewhere
+	blog(LOG_DEBUG, "Replay source render called");
 }
