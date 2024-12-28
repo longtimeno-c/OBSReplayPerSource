@@ -48,6 +48,7 @@ MODULE_EXPORT const char *obs_module_name(void)
 }
 
 bool plugin_enabled = true;
+static bool plugin_fully_initialized = false;
 
 // Forward declarations
 static std::mutex buffer_mutex;
@@ -953,29 +954,35 @@ bool obs_module_load(void)
 {
 	blog(LOG_INFO, "Loading OBS Replay Plugin version %s", PLUGIN_VERSION);
 
-	// Only register the source info once
-	static bool source_registered = false;
-	if (!source_registered) {
-		obs_register_source(&replay_source_info);
-		source_registered = true;
-	}
-	
-	// Create initial replay scene and source
-	if (!create_replay_scene_and_source()) {
-		blog(LOG_ERROR, "Failed to create replay scene and source");
-		return false;
-	}
+	// Register for frontend events to know when OBS is fully initialized
+    obs_frontend_add_event_callback([](enum obs_frontend_event event, void *) {
+        if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+            blog(LOG_INFO, "OBS frontend finished loading, initializing plugin...");
+            plugin_fully_initialized = true;
+            
+            // Move initialization here
+            if (!create_replay_scene_and_source()) {
+                blog(LOG_ERROR, "Failed to create replay scene and source");
+                return;
+            }
 
-	// Initialize scene buffers
-	update_scene_buffers();
-	
-	// Start capture only after successful initialization
-	if (plugin_enabled) {
-		start_video_capture();
-		start_audio_capture();
-	}
-	// Create initial replay scene and source
-	create_replay_scene_and_source();
+            // Initialize scene buffers
+            update_scene_buffers();
+            
+            // Start capture only after successful initialization
+            if (plugin_enabled) {
+                start_video_capture();
+                start_audio_capture();
+            }
+        }
+    }, nullptr);
+
+    // Only register the source info once
+    static bool source_registered = false;
+    if (!source_registered) {
+        obs_register_source(&replay_source_info);
+        source_registered = true;
+    }
 
 	// Load settings
 	obs_data_t *settings = obs_get_private_data();
